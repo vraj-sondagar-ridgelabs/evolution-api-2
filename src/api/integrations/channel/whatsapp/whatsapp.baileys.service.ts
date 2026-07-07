@@ -3951,33 +3951,60 @@ export class BaileysStartupService extends ChannelStartupService {
     }
   }
 
-  // [PATCH lid-resolve] Resolve one or more @lid privacy ids to their REAL phone
-  // JID using Baileys' live LID↔PN mapping (signalRepository.lidMapping). This is
-  // the bridge that recovers the phone for @lid chats that carry no remoteJidAlt
-  // in stored messages (business / privacy contacts). Returns a map
-  // { "<lid>": "<phone digits>" | null }. Missing/unmapped ids resolve to null.
+  // [PATCH lid-resolve] Resolve one or more @lid privacy ids to their REAL phone.
+  // Two bridges, in order:
+  //   1. Baileys' live LID↔PN mapping (signalRepository.lidMapping.getPNForLID)
+  //   2. DEEP message scan — search EVERY stored message of the chat for any
+  //      field that can carry the phone (key.remoteJidAlt / senderPn /
+  //      participantAlt / participantPn, contextInfo.participant). WhatsApp leaks
+  //      the PN in different places depending on message age/direction, so one
+  //      SQL over the whole history recovers numbers the live mapping misses.
+  // Returns { "<lid>": "<phone digits>" | null }.
   public async resolveLid({ lids }: { lids: string[] }) {
     const out: Record<string, string | null> = {};
     const mapping = (this.client as any)?.signalRepository?.lidMapping;
+    const clean = (jid: any): string | null => {
+      const digits = jid ? String(jid).split('@')[0].split(':')[0].replace(/\D/g, '') : '';
+      return digits.length >= 8 && digits.length <= 15 ? digits : null; // reject "0"/junk
+    };
     for (const raw of Array.isArray(lids) ? lids : []) {
       const lid = String(raw || '');
       if (!lid) continue;
       if (!lid.endsWith('@lid')) {
-        // Already a phone JID (or bare number) → strip to digits (drop @domain
-        // AND the :device suffix, e.g. "919408740590:0@s.whatsapp.net").
-        out[lid] = lid.split('@')[0].split(':')[0].replace(/\D/g, '') || null;
+        out[lid] = clean(lid); // already a phone JID / bare number
         continue;
       }
+      // Bridge 1: live Baileys mapping.
+      let phone: string | null = null;
       try {
         const pn = mapping?.getPNForLID ? await mapping.getPNForLID(lid) : null;
-        // getPNForLID returns e.g. "919408740590:0@s.whatsapp.net" — split on BOTH
-        // '@' and ':' so the trailing device index (":0") doesn't leave a spurious
-        // extra digit on the phone number.
-        const digits = pn ? String(pn).split('@')[0].split(':')[0].replace(/\D/g, '') : '';
-        out[lid] = digits || null;
-      } catch {
-        out[lid] = null;
+        phone = clean(pn);
+      } catch { /* mapping miss */ }
+      // Bridge 2: deep scan of the chat's stored messages for any PN-carrying field.
+      if (!phone) {
+        try {
+          const rows: any[] = await this.prismaRepository.$queryRaw`
+            SELECT COALESCE(
+              NULLIF(split_part("key"->>'remoteJidAlt','@',1), ''),
+              NULLIF(split_part("key"->>'senderPn','@',1), ''),
+              NULLIF(split_part("key"->>'participantAlt','@',1), ''),
+              NULLIF(split_part("key"->>'participantPn','@',1), ''),
+              NULLIF(split_part("contextInfo"->>'participant','@',1), '')
+            ) AS phone
+            FROM "Message"
+            WHERE "instanceId" = ${this.instanceId} AND "key"->>'remoteJid' = ${lid}
+              AND (
+                "key"->>'remoteJidAlt'        LIKE '%@s.whatsapp.net' OR
+                "key"->>'senderPn'            LIKE '%@s.whatsapp.net' OR
+                "key"->>'participantAlt'      LIKE '%@s.whatsapp.net' OR
+                "key"->>'participantPn'       LIKE '%@s.whatsapp.net' OR
+                "contextInfo"->>'participant' LIKE '%@s.whatsapp.net'
+              )
+            LIMIT 1`;
+          phone = clean(rows?.[0]?.phone);
+        } catch { /* raw scan unavailable → leave null */ }
       }
+      out[lid] = phone;
     }
     return out;
   }
