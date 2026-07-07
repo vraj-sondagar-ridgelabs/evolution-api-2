@@ -834,6 +834,38 @@ export class BaileysStartupService extends ChannelStartupService {
   private readonly contactHandle = {
     'contacts.upsert': async (contacts: Contact[]) => {
       try {
+        // [PATCH lid-map-store] Each synced Contact can carry BOTH its phone JID
+        // (contact.id = <phone>@s.whatsapp.net) AND its @lid (contact.lid). WhatsApp
+        // delivers this pairing during sync, but upstream discards contact.lid — so
+        // later we can't map an @lid chat back to the phone (and thus to YOUR saved
+        // address-book name). Feed every (lid, phone) pair we see into Baileys'
+        // lidMapping store so getPNForLID() can resolve them afterwards, AND persist
+        // an @lid Contact row carrying the same saved pushName as the phone row.
+        try {
+          const mapping = (this.client as any)?.signalRepository?.lidMapping;
+          const pairs = contacts
+            .filter((c: any) => c?.lid && c?.id?.includes('@s.whatsapp.net'))
+            .map((c: any) => ({ lid: c.lid, pn: c.id }));
+          if (pairs.length && mapping?.storeLIDPNMappings) {
+            await mapping.storeLIDPNMappings(pairs);
+          }
+          // Also persist an @lid Contact row that mirrors the saved name, so the
+          // DB name-resolver can bridge @lid → saved name directly.
+          const lidRows = contacts
+            .filter((c: any) => c?.lid && (c?.name || c?.verifiedName))
+            .map((c: any) => ({
+              remoteJid: c.lid,
+              pushName: c.name || c.verifiedName,
+              profilePicUrl: null,
+              instanceId: this.instanceId,
+            }));
+          if (lidRows.length && this.configService.get<Database>('DATABASE').SAVE_DATA.CONTACTS) {
+            await this.prismaRepository.contact.createMany({ data: lidRows, skipDuplicates: true });
+          }
+        } catch (e) {
+          this.logger.warn(['lid-map-store: failed to persist LID↔PN mapping', (e as any)?.message]);
+        }
+
         const contactsRaw: any = contacts.map((contact) => ({
           remoteJid: contact.id,
           pushName: contact?.name || contact?.verifiedName || contact.id.split('@')[0],
