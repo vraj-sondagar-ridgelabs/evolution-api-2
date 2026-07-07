@@ -277,9 +277,24 @@ export class BaileysStartupService extends ChannelStartupService {
 
   public async logoutInstance() {
     this.messageProcessor.onDestroy();
-    await this.client?.logout('Log out instance: ' + this.instanceName);
+    // [PATCH logout-purge] client.logout() THROWS "Connection Closed" when the
+    // socket is already down (e.g. the user removed the device from their PHONE).
+    // Previously that error aborted logoutInstance BEFORE the credential purge
+    // below ran, so the Baileys auth creds survived and re-creating the (same,
+    // deterministic) instance name silently reconnected — "logout didn't work".
+    // Swallow logout errors so the purge ALWAYS runs; a failed WS logout on an
+    // already-closed socket is harmless.
+    try {
+      await this.client?.logout('Log out instance: ' + this.instanceName);
+    } catch (err) {
+      this.logger.warn(['logoutInstance: client.logout failed (already closed?)', (err as any)?.message]);
+    }
 
-    this.client?.ws?.close();
+    try {
+      this.client?.ws?.close();
+    } catch {
+      /* socket already closed */
+    }
 
     const db = this.configService.get<Database>('DATABASE');
     const cache = this.configService.get<CacheConf>('CACHE');
