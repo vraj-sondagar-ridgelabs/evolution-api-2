@@ -453,7 +453,19 @@ export class BaileysStartupService extends ChannelStartupService {
     if (connection === 'close') {
       const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
       const codesToNotReconnect = [DisconnectReason.loggedOut, DisconnectReason.forbidden, 402, 406];
-      const shouldReconnect = !codesToNotReconnect.includes(statusCode);
+      // [PATCH logout-race] Once a terminal code (loggedOut / device_removed=401,
+      // forbidden, 402, 406) fires, the session is DEAD and must go to QR-wait.
+      // But WhatsApp often emits follow-up 'close' events (connectionClosed=428,
+      // restartRequired=515) from the dying socket a beat later. Without a guard,
+      // shouldReconnect=true on THOSE codes re-runs connectToWhatsapp() with the
+      // not-yet-purged creds → a ZOMBIE session that reports 'open' again without
+      // a fresh scan, so every API call 401s and the UI shows "Session
+      // disconnected" even right after a QR scan. Latch endSession=true on the
+      // terminal code so all subsequent events (including a zombie 'open') are
+      // ignored until connectToWhatsapp() clears the latch on a genuine restart.
+      const terminal = codesToNotReconnect.includes(statusCode);
+      const shouldReconnect = !terminal && !this.endSession;
+      if (terminal) this.endSession = true;
       if (shouldReconnect) {
         await this.connectToWhatsapp(this.phoneNumber);
       } else {
@@ -491,7 +503,10 @@ export class BaileysStartupService extends ChannelStartupService {
       }
     }
 
-    if (connection === 'open') {
+    if (connection === 'open' && !this.endSession) {
+      // [PATCH logout-race] Guard: a zombie socket that was just logged out
+      // (endSession latched) can still emit a stray 'open'. Ignore it so we don't
+      // resurrect a dead session into a fake 'authenticated' state.
       this.instance.wuid = this.client.user.id.replace(/:\d+/, '');
       try {
         const profilePic = await this.profilePicture(this.instance.wuid);
@@ -1772,32 +1787,47 @@ export class BaileysStartupService extends ChannelStartupService {
           }
 
           if (findMessage && update.status !== undefined && status[update.status] !== findMessage.status) {
-            if (!key.fromMe && key.remoteJid) {
-              readChatToUpdate[key.remoteJid] = true;
+            // [PATCH fromme-status] Persist the new status to the Message row for
+            // BOTH directions. Upstream trapped this write inside `!key.fromMe`,
+            // so OUR OWN sent messages never advanced past PENDING/SERVER_ACK in
+            // the Message table — the delivered/read tick on outbound messages
+            // stayed stuck (MessageUpdate had DELIVERY_ACK/READ but Message.status
+            // did not). The read-RECEIPT bookkeeping below (marking the peer's
+            // messages read + bumping unread counts) is genuinely inbound-only and
+            // stays gated on `!key.fromMe`; only the status persist is hoisted out.
+            const { remoteJid } = key;
+            const timestamp = findMessage.messageTimestamp;
+            // Dedup key MUST include the status: a message progresses
+            // SERVER_ACK → DELIVERY_ACK → READ, and each distinct transition must
+            // be allowed through. Keying on (jid,timestamp,fromMe) alone (as
+            // upstream did for read-marking) would let DELIVERY_ACK cache the key
+            // and then SKIP the later READ — leaving the outbound tick stuck at
+            // "delivered". Including the status makes only exact repeats dedup.
+            const statusKey = `${remoteJid}_${timestamp}_${key.fromMe?.toString()}_${status[update.status]}`;
+            const alreadyApplied = await this.baileysCache.get(statusKey);
 
-              const { remoteJid } = key;
-              const timestamp = findMessage.messageTimestamp;
-              const fromMe = key.fromMe.toString();
-              const messageKey = `${remoteJid}_${timestamp}_${fromMe}`;
-
-              const cachedTimestamp = await this.baileysCache.get(messageKey);
-
-              if (!cachedTimestamp) {
+            if (!alreadyApplied) {
+              // Inbound-only: mark the peer's messages read + flag the chat for an
+              // unread-count refresh. Never runs for our own (fromMe) messages.
+              if (!key.fromMe && key.remoteJid) {
+                readChatToUpdate[key.remoteJid] = true;
                 if (status[update.status] === status[4]) {
                   this.logger.log(`Update as read in message.update ${remoteJid} - ${timestamp}`);
                   await this.updateMessagesReadedByTimestamp(remoteJid, timestamp);
-                  await this.baileysCache.set(messageKey, true, this.MESSAGE_CACHE_TTL_SECONDS);
                 }
-
-                await this.prismaRepository.message.update({
-                  where: { id: findMessage.id },
-                  data: { status: status[update.status] },
-                });
-              } else {
-                this.logger.info(
-                  `Update readed messages duplicated ignored in message.update [avoid deadlock]: ${messageKey}`,
-                );
               }
+
+              // Both directions: persist the delivered/read/sent status so the tick
+              // reflects reality (this is the fromme-status fix — was gated out before).
+              await this.baileysCache.set(statusKey, true, this.MESSAGE_CACHE_TTL_SECONDS);
+              await this.prismaRepository.message.update({
+                where: { id: findMessage.id },
+                data: { status: status[update.status] },
+              });
+            } else {
+              this.logger.info(
+                `Update status duplicated ignored in message.update [avoid deadlock]: ${statusKey}`,
+              );
             }
           }
 
