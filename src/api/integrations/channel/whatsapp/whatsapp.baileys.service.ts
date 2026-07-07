@@ -3963,13 +3963,17 @@ export class BaileysStartupService extends ChannelStartupService {
       const lid = String(raw || '');
       if (!lid) continue;
       if (!lid.endsWith('@lid')) {
-        // Already a phone JID (or bare number) → just strip to digits.
-        out[lid] = lid.split('@')[0].replace(/\D/g, '') || null;
+        // Already a phone JID (or bare number) → strip to digits (drop @domain
+        // AND the :device suffix, e.g. "919408740590:0@s.whatsapp.net").
+        out[lid] = lid.split('@')[0].split(':')[0].replace(/\D/g, '') || null;
         continue;
       }
       try {
         const pn = mapping?.getPNForLID ? await mapping.getPNForLID(lid) : null;
-        const digits = pn ? String(pn).split('@')[0].replace(/\D/g, '') : '';
+        // getPNForLID returns e.g. "919408740590:0@s.whatsapp.net" — split on BOTH
+        // '@' and ':' so the trailing device index (":0") doesn't leave a spurious
+        // extra digit on the phone number.
+        const digits = pn ? String(pn).split('@')[0].split(':')[0].replace(/\D/g, '') : '';
         out[lid] = digits || null;
       } catch {
         out[lid] = null;
