@@ -258,6 +258,17 @@ export class BaileysStartupService extends ChannelStartupService {
 
   public stateConnection: wa.StateConnection = { state: 'close' };
 
+  // [PATCH sync-progress] Live WhatsApp history-sync progress, updated from the
+  // messaging-history.set handler (Baileys emits a real 0-100 `progress` + a final
+  // `isLatest`). Surfaced on the instanceInfo/fetchInstances response so a client
+  // can show a true progress bar instead of inferring from row counts.
+  public historySync: { progress: number; isLatest: boolean; syncing: boolean; updatedAt: number } = {
+    progress: 0,
+    isLatest: false,
+    syncing: false,
+    updatedAt: 0,
+  };
+
   public phoneNumber: string;
 
   public get connectionStatus() {
@@ -947,6 +958,15 @@ export class BaileysStartupService extends ChannelStartupService {
           `recv ${chats.length} chats, ${contacts.length} contacts, ${messages.length} msgs (is latest: ${isLatest}, progress: ${progress}%), type: ${syncType}`,
         );
 
+        // [PATCH sync-progress] Record the real Baileys history-sync progress so
+        // the instanceInfo response can surface a true % (syncing until isLatest).
+        this.historySync = {
+          progress: typeof progress === 'number' ? progress : this.historySync.progress,
+          isLatest: !!isLatest,
+          syncing: !isLatest,
+          updatedAt: Date.now(),
+        };
+
         const instance: InstanceDto = { instanceName: this.instance.name };
 
         let timestampLimitToImport = null;
@@ -1040,6 +1060,25 @@ export class BaileysStartupService extends ChannelStartupService {
               m.pushName = contactsMap.get(participantJid).name;
             } else if (participantJid) {
               m.pushName = participantJid.split('@')[0];
+            }
+          }
+
+          // [PATCH @lid-history] Bridge old @lid history chats to the real phone.
+          // We do NOT rewrite key.remoteJid (the Chat row is still keyed by @lid, so
+          // rewriting would orphan the message from its chat). Instead we ensure the
+          // real-phone mapping is PRESERVED on the stored key as remoteJidAlt, which
+          // is exactly what the downstream name-resolver reads to map @lid → your
+          // saved contact name/number. Baileys usually populates remoteJidAlt on the
+          // key already; when it instead carries the phone in senderPn/participantAlt
+          // (older shapes) we copy it across so history rows match the live path.
+          if (m.key?.remoteJid?.includes('@lid') && !m.key?.remoteJidAlt) {
+            const altPhone =
+              (m.key as any).senderPn ||
+              (m.key as any).participantAlt ||
+              (m.key as any).participantPn ||
+              null;
+            if (altPhone && String(altPhone).includes('@s.whatsapp.net')) {
+              m.key.remoteJidAlt = altPhone;
             }
           }
 
