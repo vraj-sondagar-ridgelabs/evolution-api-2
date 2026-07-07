@@ -3919,6 +3919,33 @@ export class BaileysStartupService extends ChannelStartupService {
     }
   }
 
+  // [PATCH lid-resolve] Resolve one or more @lid privacy ids to their REAL phone
+  // JID using Baileys' live LID↔PN mapping (signalRepository.lidMapping). This is
+  // the bridge that recovers the phone for @lid chats that carry no remoteJidAlt
+  // in stored messages (business / privacy contacts). Returns a map
+  // { "<lid>": "<phone digits>" | null }. Missing/unmapped ids resolve to null.
+  public async resolveLid({ lids }: { lids: string[] }) {
+    const out: Record<string, string | null> = {};
+    const mapping = (this.client as any)?.signalRepository?.lidMapping;
+    for (const raw of Array.isArray(lids) ? lids : []) {
+      const lid = String(raw || '');
+      if (!lid) continue;
+      if (!lid.endsWith('@lid')) {
+        // Already a phone JID (or bare number) → just strip to digits.
+        out[lid] = lid.split('@')[0].replace(/\D/g, '') || null;
+        continue;
+      }
+      try {
+        const pn = mapping?.getPNForLID ? await mapping.getPNForLID(lid) : null;
+        const digits = pn ? String(pn).split('@')[0].replace(/\D/g, '') : '';
+        out[lid] = digits || null;
+      } catch {
+        out[lid] = null;
+      }
+    }
+    return out;
+  }
+
   public async getBase64FromMediaMessage(data: getBase64FromMediaMessageDto, getBuffer = false) {
     try {
       const m = data?.message;
