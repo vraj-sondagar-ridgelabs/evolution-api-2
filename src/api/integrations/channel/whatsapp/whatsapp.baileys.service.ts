@@ -113,6 +113,7 @@ import makeWASocket, {
   isJidBroadcast,
   isJidGroup,
   isJidNewsletter,
+  addTransactionCapability,
   isPnUser,
   jidNormalizedUser,
   makeCacheableSignalKeyStore,
@@ -668,7 +669,22 @@ export class BaileysStartupService extends ChannelStartupService {
       printQRInTerminal: false,
       auth: {
         creds: this.instance.authState.state.creds,
-        keys: makeCacheableSignalKeyStore(this.instance.authState.state.keys, P({ level: 'error' }) as any),
+        // [PATCH lid-persist] Wrap the key store with addTransactionCapability
+        // BEFORE caching. Baileys' lidMapping.storeLIDPNMappings() writes its
+        // LID<->PN mappings inside a this.keys.transaction() — and Evolution's
+        // Prisma/Redis auth adapter has no transaction() method, so without this
+        // wrapper those writes silently no-op. Result: getPNForLID() always
+        // returned null and @lid chats never resolved to a phone (even though
+        // WhatsApp Web, which uses the full adapter, shows the number). Adding
+        // transaction capability makes the mappings actually persist.
+        keys: makeCacheableSignalKeyStore(
+          addTransactionCapability(
+            this.instance.authState.state.keys,
+            P({ level: 'error' }) as any,
+            { maxCommitRetries: 10, delayBetweenTriesMs: 3000 },
+          ),
+          P({ level: 'error' }) as any,
+        ),
       },
       msgRetryCounterCache: this.msgRetryCounterCache,
       generateHighQualityLinkPreview: true,
@@ -4007,6 +4023,39 @@ export class BaileysStartupService extends ChannelStartupService {
       out[lid] = phone;
     }
     return out;
+  }
+
+  // [PATCH lid-sync] Fetch LID↔PN mappings DIRECTLY from WhatsApp's servers.
+  // WhatsApp offers no live LID→phone lookup (that's the point of LID privacy),
+  // but it DOES answer phone→LID via the USync `lid` protocol. So we sweep every
+  // phone-keyed contact we know through lidMapping.getLIDsForPNs(), which runs the
+  // live USync query for cache misses AND auto-stores the results in the mapping
+  // store. After one sweep, getPNForLID() — and therefore resolveLid and the whole
+  // display chain — resolves every @lid chat that belongs to any known contact.
+  // Batched (100/query) to stay gentle on the socket. Returns sweep stats.
+  public async syncLidMappings() {
+    const mapping = (this.client as any)?.signalRepository?.lidMapping;
+    if (!mapping?.getLIDsForPNs) {
+      return { swept: 0, mapped: 0, reason: 'lidMapping unavailable' };
+    }
+    // Every phone-keyed contact we have (the user's synced address book).
+    const contacts = await this.prismaRepository.contact.findMany({
+      where: { instanceId: this.instanceId, remoteJid: { endsWith: '@s.whatsapp.net' } },
+      select: { remoteJid: true },
+    });
+    const pns = contacts.map((c) => c.remoteJid);
+    let mapped = 0;
+    const BATCH = 100;
+    for (let i = 0; i < pns.length; i += BATCH) {
+      const batch = pns.slice(i, i + BATCH);
+      try {
+        const pairs = await mapping.getLIDsForPNs(batch); // live USync for misses; auto-stores
+        mapped += Array.isArray(pairs) ? pairs.length : 0;
+      } catch (err) {
+        this.logger.warn(['syncLidMappings batch failed', (err as any)?.message]);
+      }
+    }
+    return { swept: pns.length, mapped };
   }
 
   public async getBase64FromMediaMessage(data: getBase64FromMediaMessageDto, getBuffer = false) {

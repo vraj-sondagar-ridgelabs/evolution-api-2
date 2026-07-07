@@ -68,6 +68,11 @@ export class ChatController {
     return await this.waMonitor.waInstances[instanceName].resolveLid(data);
   }
 
+  // [PATCH lid-sync] Live-sweep phone→LID mappings from WhatsApp's servers.
+  public async syncLidMappings({ instanceName }: InstanceDto) {
+    return await this.waMonitor.waInstances[instanceName].syncLidMappings();
+  }
+
   public async fetchMessages({ instanceName }: InstanceDto, query: Query<Message>) {
     return await this.waMonitor.waInstances[instanceName].fetchMessages(query);
   }

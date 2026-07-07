@@ -144,6 +144,18 @@ export class ChatRouter extends RouterBroker {
 
         return res.status(HttpStatus.OK).json(response);
       })
+      // [PATCH lid-sync] Live phone→LID sweep against WhatsApp servers.
+      // POST /chat/syncLidMappings/:instance  {}  → { swept, mapped }
+      .post(this.routerPath('syncLidMappings'), ...guards, async (req, res) => {
+        const response = await this.dataValidate<any>({
+          request: req,
+          schema: null,
+          ClassRef: Object,
+          execute: (instance) => chatController.syncLidMappings(instance),
+        });
+
+        return res.status(HttpStatus.OK).json(response);
+      })
       // TODO: corrigir updateMessage para medias tambem
       .post(this.routerPath('updateMessage'), ...guards, async (req, res) => {
         const response = await this.dataValidate<UpdateMessageDto>({
