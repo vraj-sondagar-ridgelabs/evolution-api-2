@@ -3888,6 +3888,37 @@ export class BaileysStartupService extends ChannelStartupService {
     return map[mediaType] || null;
   }
 
+  // [PATCH fetch-history] On-demand older-history pull. WhatsApp's initial
+  // multi-device sync only delivers a bounded window per chat, so old messages of
+  // a specific chat can be missing even when the DB has years of other chats.
+  // fetchMessageHistory(count, oldestKey, oldestTimestamp) asks WhatsApp for
+  // messages OLDER than the given anchor; the results arrive asynchronously via
+  // the normal messaging-history.set handler (ON_DEMAND syncType) and get saved
+  // like any other history. We anchor on the OLDEST message we currently have for
+  // the chat. Call repeatedly (each call walks further back) until no new older
+  // messages arrive. Returns { requested, oldestTimestamp } or { requested:false }
+  // when there's nothing to anchor on.
+  public async requestChatHistory({ remoteJid, count }: { remoteJid: string; count?: number }) {
+    const want = Math.min(Math.max(Number(count) || 50, 1), 50); // Baileys caps at 50/req
+    // Find the oldest stored message for this chat to use as the "before" anchor.
+    const oldest = await this.prismaRepository.message.findFirst({
+      where: { instanceId: this.instanceId, key: { path: ['remoteJid'], equals: remoteJid } },
+      orderBy: { messageTimestamp: 'asc' },
+    });
+    if (!oldest) {
+      return { requested: false, reason: 'no messages stored for this chat to anchor on' };
+    }
+    const key = oldest.key as any;
+    const ts = Number(oldest.messageTimestamp);
+    try {
+      const requestId = await this.client.fetchMessageHistory(want, key, ts);
+      return { requested: true, requestId, anchorTimestamp: ts, anchorMessageId: key?.id ?? null };
+    } catch (err) {
+      this.logger.error(['requestChatHistory failed', (err as any)?.message]);
+      return { requested: false, reason: (err as any)?.message ?? 'fetchMessageHistory failed' };
+    }
+  }
+
   public async getBase64FromMediaMessage(data: getBase64FromMediaMessageDto, getBuffer = false) {
     try {
       const m = data?.message;

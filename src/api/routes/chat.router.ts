@@ -120,6 +120,18 @@ export class ChatRouter extends RouterBroker {
 
         return res.status(HttpStatus.CREATED).json(response);
       })
+      // [PATCH fetch-history] On-demand older-history pull for a chat.
+      // POST /chat/requestHistory/:instance  { remoteJid, count? }
+      .post(this.routerPath('requestHistory'), ...guards, async (req, res) => {
+        const response = await this.dataValidate<any>({
+          request: req,
+          schema: null,
+          ClassRef: Object,
+          execute: (instance, data) => chatController.requestChatHistory(instance, data),
+        });
+
+        return res.status(HttpStatus.OK).json(response);
+      })
       // TODO: corrigir updateMessage para medias tambem
       .post(this.routerPath('updateMessage'), ...guards, async (req, res) => {
         const response = await this.dataValidate<UpdateMessageDto>({

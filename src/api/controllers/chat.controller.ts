@@ -58,6 +58,11 @@ export class ChatController {
     return await this.waMonitor.waInstances[instanceName].getBase64FromMediaMessage(data);
   }
 
+  // [PATCH fetch-history] Request older history for a chat (on-demand pull).
+  public async requestChatHistory({ instanceName }: InstanceDto, data: { remoteJid: string; count?: number }) {
+    return await this.waMonitor.waInstances[instanceName].requestChatHistory(data);
+  }
+
   public async fetchMessages({ instanceName }: InstanceDto, query: Query<Message>) {
     return await this.waMonitor.waInstances[instanceName].fetchMessages(query);
   }
